@@ -7,7 +7,7 @@ app.post('/generate', async (req, res) => {
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer GROQ_API_KEY_REMOVED' },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer GROQ_API_KEY_PLACEHOLDER' },
       body: JSON.stringify({ model: 'llama-3.3-70b-versatile', max_tokens: 1000, messages: [{ role: 'user', content: req.body.prompt }] })
     });
     const data = await response.json();
