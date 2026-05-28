@@ -154,7 +154,7 @@ app.post('/analyze-youtube', async (req, res) => {
   const { handle } = req.body;
   if (!handle) return res.status(400).json({ error: 'handle is required' });
   const clean = handle.replace(/^@/, '').trim();
-  const prompt = `You are an elite YouTube growth strategist and video SEO expert with 10+ years analyzing thousands of channels. Analyze the YouTube channel @${clean} with extreme depth and precision.
+  const prompt = `You are an elite YouTube growth strategist. Analyze the YouTube channel @${clean} with extreme depth.
 
 Return ONLY a JSON object with these exact fields:
 
@@ -164,22 +164,22 @@ Return ONLY a JSON object with these exact fields:
   "profileStrength": <0-100>,
   "monetizationPotential": <0-100>,
   "stats": [
-    {"label": "Est. Subscribers",     "value": "<human-readable>", "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Avg. Views / Video",   "value": "<human-readable>", "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Upload Frequency",     "value": "<e.g. 2x/week>",   "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Audience Retention",   "value": "<e.g. 48%>",       "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Click-Through Rate",   "value": "<e.g. 6.2%>",      "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "SEO Optimization",     "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Content Consistency",  "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Monetization Score",   "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"}
+    {"label": "Est. Subscribers",   "value": "<human-readable>", "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Avg. Views / Video", "value": "<human-readable>", "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Upload Frequency",   "value": "<e.g. 2x/week>",   "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Content Quality",    "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "SEO Score",          "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Audience Retention", "value": "<e.g. 48%>",       "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Monetization Score", "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Growth Velocity",    "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"}
   ],
   "sections": [
-    {"title": "Content & Series Strategy",       "content": "<3-4 sentences>"},
-    {"title": "Audience & Engagement Quality",   "content": "<3-4 sentences>"},
-    {"title": "YouTube SEO & Discoverability",   "content": "<3-4 sentences>"},
-    {"title": "Growth Opportunities",            "content": "<3-4 sentences>"},
-    {"title": "Monetization Roadmap",            "content": "<3-4 sentences>"},
-    {"title": "Competitor Positioning",          "content": "<3-4 sentences>"}
+    {"title": "Content Strategy",       "content": "<3-4 sentences>"},
+    {"title": "Audience & Engagement",  "content": "<3-4 sentences>"},
+    {"title": "YouTube SEO",            "content": "<3-4 sentences>"},
+    {"title": "Growth Opportunities",   "content": "<3-4 sentences>"},
+    {"title": "Monetization Roadmap",   "content": "<3-4 sentences>"},
+    {"title": "Competitor Positioning", "content": "<3-4 sentences>"}
   ],
   "strengths":              ["<5-6 specific items>"],
   "warnings":               ["<3-5 specific items>"],
