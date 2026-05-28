@@ -32,7 +32,9 @@ async function fetchPlaceById(placeId) {
   const r = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
     headers: { 'X-Goog-Api-Key': GOOGLE_PLACES_KEY, 'X-Goog-FieldMask': DETAIL_FIELDS },
   });
-  return r.json();
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message || 'Google Places API error');
+  return d;
 }
 
 async function textSearchPlace(query) {
@@ -46,6 +48,7 @@ async function textSearchPlace(query) {
     body: JSON.stringify({ textQuery: query, maxResultCount: 1 }),
   });
   const d = await r.json();
+  if (d.error) throw new Error(d.error.message || 'Google Places API error');
   return d.places?.[0] ?? null;
 }
 
@@ -320,7 +323,7 @@ app.post('/place-details', async (req, res) => {
       place = await textSearchPlace(extracted.value);
     }
 
-    if (!place || place.error) return res.status(404).json({ error: 'Place not found', details: place?.error });
+    if (!place) return res.status(404).json({ error: 'Place not found' });
     res.json(formatPlace(place));
   } catch (e) {
     res.status(500).json({ error: e.message });
