@@ -150,5 +150,73 @@ Return ONLY a JSON object with these exact fields:
   }
 });
 
+app.post('/analyze-youtube', async (req, res) => {
+  const { handle } = req.body;
+  if (!handle) return res.status(400).json({ error: 'handle is required' });
+  const clean = handle.replace(/^@/, '').trim();
+  const prompt = `You are an elite YouTube growth strategist and video SEO expert with 10+ years analyzing thousands of channels. Analyze the YouTube channel @${clean} with extreme depth and precision.
+
+Return ONLY a JSON object with these exact fields:
+
+{
+  "overallScore": <0-100, be precise and realistic>,
+  "accountType": "<e.g. Local Business, Personal Brand, Education, Entertainment, E-commerce>",
+  "profileStrength": <0-100>,
+  "monetizationPotential": <0-100>,
+  "stats": [
+    {"label": "Est. Subscribers",     "value": "<human-readable>", "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Avg. Views / Video",   "value": "<human-readable>", "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Upload Frequency",     "value": "<e.g. 2x/week>",   "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Audience Retention",   "value": "<e.g. 48%>",       "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Click-Through Rate",   "value": "<e.g. 6.2%>",      "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "SEO Optimization",     "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Content Consistency",  "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"},
+    {"label": "Monetization Score",   "value": "<rating>",         "score": <0-100>, "insight": "<one sentence>"}
+  ],
+  "sections": [
+    {"title": "Content & Series Strategy",       "content": "<3-4 sentences>"},
+    {"title": "Audience & Engagement Quality",   "content": "<3-4 sentences>"},
+    {"title": "YouTube SEO & Discoverability",   "content": "<3-4 sentences>"},
+    {"title": "Growth Opportunities",            "content": "<3-4 sentences>"},
+    {"title": "Monetization Roadmap",            "content": "<3-4 sentences>"},
+    {"title": "Competitor Positioning",          "content": "<3-4 sentences>"}
+  ],
+  "strengths":              ["<5-6 specific items>"],
+  "warnings":               ["<3-5 specific items>"],
+  "criticalGaps":           ["<2-4 critical gaps>"],
+  "quickWins":              ["<3-5 actionable things they can do this week>"],
+  "contentPillars":         ["<4-5 suggested content pillars for their niche>"],
+  "bestPostingTimes":       "<specific recommendation>",
+  "hashtagStrategy":        "<specific YouTube tags and keyword recommendation>",
+  "estimatedMonthlyReach":  "<string estimate of monthly views>"
+}`;
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 3000,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'You are a JSON-only API. Always respond with a single valid JSON object and nothing else.' },
+          { role: 'user',   content: prompt },
+        ],
+      }),
+    });
+    const data = await response.json();
+    const raw = data.choices?.[0]?.message?.content || '';
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      const result = JSON.parse(match ? match[0] : raw);
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to parse analysis JSON', raw });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
