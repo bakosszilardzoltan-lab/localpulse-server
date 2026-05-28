@@ -3,12 +3,87 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const GOOGLE_PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const DETAIL_FIELDS = 'id,displayName,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,regularOpeningHours,types,reviews';
+const SEARCH_FIELD_MASK = DETAIL_FIELDS.split(',').map(f => `places.${f}`).join(',');
+
+function formatPlace(place) {
+  return {
+    placeId: place.id,
+    name: place.displayName?.text ?? place.displayName,
+    rating: place.rating,
+    userRatingCount: place.userRatingCount,
+    formattedAddress: place.formattedAddress,
+    nationalPhoneNumber: place.nationalPhoneNumber,
+    websiteUri: place.websiteUri,
+    regularOpeningHours: place.regularOpeningHours,
+    types: place.types,
+    reviews: (place.reviews || []).slice(0, 5).map(r => ({
+      author: r.authorAttribution?.displayName,
+      rating: r.rating,
+      text: r.text?.text,
+      relativeTime: r.relativePublishTimeDescription,
+    })),
+  };
+}
+
+async function fetchPlaceById(placeId) {
+  const r = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+    headers: { 'X-Goog-Api-Key': GOOGLE_PLACES_KEY, 'X-Goog-FieldMask': DETAIL_FIELDS },
+  });
+  return r.json();
+}
+
+async function textSearchPlace(query) {
+  const r = await fetch('https://places.googleapis.com/v1/places:searchText', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': GOOGLE_PLACES_KEY,
+      'X-Goog-FieldMask': SEARCH_FIELD_MASK,
+    },
+    body: JSON.stringify({ textQuery: query, maxResultCount: 1 }),
+  });
+  const d = await r.json();
+  return d.places?.[0] ?? null;
+}
+
+async function resolveMapsUrl(url) {
+  if (url.includes('goo.gl') || url.includes('maps.app')) {
+    const r = await fetch(url, { redirect: 'follow' });
+    return r.url;
+  }
+  return url;
+}
+
+function extractQueryFromUrl(url) {
+  const placeIdMatch = url.match(/!1s(ChIJ[^!&]+)/);
+  if (placeIdMatch) return { type: 'id', value: decodeURIComponent(placeIdMatch[1]) };
+
+  const nameMatch = url.match(/\/maps\/place\/([^/@?#]+)/);
+  if (nameMatch) return { type: 'query', value: decodeURIComponent(nameMatch[1].replace(/\+/g, ' ')) };
+
+  try {
+    const u = new URL(url);
+    const q = u.searchParams.get('q') || u.searchParams.get('query');
+    if (q) return { type: 'query', value: q };
+  } catch {}
+
+  return null;
+}
+
 app.post('/generate', async (req, res) => {
   try {
+    let prompt = req.body.prompt;
+    const { placeData } = req.body;
+    if (placeData) {
+      prompt = `Here is REAL data for this business from Google: name=${placeData.name}, rating=${placeData.rating}, reviews=${placeData.userRatingCount}, address=${placeData.formattedAddress}. Use this real data in your analysis.\n\n${prompt}`;
+    }
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
-      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', max_tokens: 1000, messages: [{ role: 'user', content: req.body.prompt }] })
+      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] })
     });
     const data = await response.json();
     res.json({ text: data.choices?.[0]?.message?.content || '' });
@@ -225,6 +300,40 @@ Return ONLY a JSON object with these exact fields:
     } catch (e) {
       res.status(500).json({ error: 'Failed to parse analysis JSON', raw });
     }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/place-details', async (req, res) => {
+  const { mapsUrl } = req.body;
+  if (!mapsUrl) return res.status(400).json({ error: 'mapsUrl is required' });
+  try {
+    const resolved = await resolveMapsUrl(mapsUrl);
+    const extracted = extractQueryFromUrl(resolved);
+    if (!extracted) return res.status(400).json({ error: 'Could not extract place info from URL' });
+
+    let place;
+    if (extracted.type === 'id') {
+      place = await fetchPlaceById(extracted.value);
+    } else {
+      place = await textSearchPlace(extracted.value);
+    }
+
+    if (!place || place.error) return res.status(404).json({ error: 'Place not found', details: place?.error });
+    res.json(formatPlace(place));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/find-place', async (req, res) => {
+  const { query } = req.body;
+  if (!query) return res.status(400).json({ error: 'query is required' });
+  try {
+    const place = await textSearchPlace(query);
+    if (!place) return res.status(404).json({ error: 'No places found for that query' });
+    res.json(formatPlace(place));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
