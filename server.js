@@ -185,50 +185,58 @@ app.post('/analyze-instagram', async (req, res) => {
   const verifiedLine   = isVerified ? `- Account is VERIFIED (blue checkmark — factor this into monetization potential)` : '';
   const postsLine      = postsCount ? `- Total posts published: ${postsCount}` : '';
 
-  const prompt = `You are an elite social media growth strategist. Based on this account data:
+  const prompt = `You are an elite Instagram growth strategist in 2026 with deep knowledge of current trends, algorithm changes, and what's actually going viral RIGHT NOW. You specialize in the ${niche} niche.
+
+Real profile data:
 - Handle: @${clean}
-- Niche: ${niche}
 ${followersLine}
+${postsLine}
 ${avgLikesLine}
 ${bioLine}
-${verifiedLine}
-${postsLine}
+${isVerified ? '- Verified: Yes (blue checkmark — factor into monetization and credibility)' : '- Verified: No'}
+- Niche: ${niche}
 
-Generate a highly personalized growth strategy. Be specific to their niche, follower count, and engagement level. Return ONLY a JSON object:
+Generate a hyper-specific, actionable growth strategy for 2026. Return ONLY a JSON object:
 
 {
-  "overallScore": <0-100 based on their real data — be honest and precise>,
-  "accountType": "<specific account type based on their niche>",
-  "growthRate": "<estimated monthly follower growth number if they follow the plan, e.g. '200-400'>",
-  "engagementRate": "<calculated from likes/followers if available, otherwise estimate for their niche>",
+  "overallScore": <realistic 0-100 score based on their real data>,
+  "scoreReason": "<one sentence explaining exactly why they got this score based on their real numbers>",
+  "accountType": "<specific account type for the ${niche} niche>",
+  "growthRate": "<realistic monthly follower estimate based on their actual engagement rate>",
+  "engagementRate": "${engRate || (avgLikes && followers ? ((avgLikes / followers) * 100).toFixed(2) + '%' : 'unknown')}",
   "viralContentIdeas": [
-    {"title": "<specific post idea>", "format": "<Reel|Carousel|Story>", "hook": "<exact opening line to use>", "whyItWorks": "<one sentence>"}
+    {
+      "title": "<VERY specific to ${niche} niche and 2026 trends, not generic>",
+      "format": "<Reel|Carousel|Story|Live>",
+      "hook": "<authentic 2026-style hook, NOT clickbait — feels natural and real>",
+      "whyItWorks": "<specific reason tied to current algorithm behavior>"
+    }
   ],
   "thirtyDayPlan": [
-    {"week": 1, "focus": "<theme>", "actions": ["<action1>", "<action2>", "<action3>"]},
-    {"week": 2, "focus": "<theme>", "actions": ["<action1>", "<action2>", "<action3>"]},
-    {"week": 3, "focus": "<theme>", "actions": ["<action1>", "<action2>", "<action3>"]},
-    {"week": 4, "focus": "<theme>", "actions": ["<action1>", "<action2>", "<action3>"]}
+    {"week": 1, "focus": "<specific theme>", "actions": ["<exact action with numbers e.g. Post 3 Reels under 30s using trending audio>", "<specific action>", "<specific action>"]},
+    {"week": 2, "focus": "<specific theme>", "actions": ["<specific action>", "<specific action>", "<specific action>"]},
+    {"week": 3, "focus": "<specific theme>", "actions": ["<specific action>", "<specific action>", "<specific action>"]},
+    {"week": 4, "focus": "<specific theme>", "actions": ["<specific action>", "<specific action>", "<specific action>"]}
   ],
-  "viralHooks": ["<10 specific viral caption hooks for their niche>"],
+  "viralHooks": ["<10 authentic, natural-sounding hooks specific to ${niche} in 2026 — NOT clickbait, should feel like real captions people actually use>"],
   "hashtagPack": {
-    "large": ["<5 hashtags with 1M+ posts>"],
-    "medium": ["<10 hashtags with 100K-1M posts>"],
-    "niche": ["<15 hashtags under 100K posts specific to their content>"]
+    "large": ["<5 hashtags with 1M+ posts specific to ${niche}>"],
+    "medium": ["<10 hashtags 100K-1M posts specific to ${niche}>"],
+    "niche": ["<15 hashtags under 100K specific to their exact content style>"]
   },
-  "bestPostingTimes": "<specific days and times for their niche with reasoning>",
-  "todayAction": "<one very specific actionable thing they should do TODAY to start growing>",
+  "bestPostingTimes": "<specific days and times based on ${niche} audience behavior in 2026>",
+  "todayAction": "<ONE very specific thing they can do TODAY — not vague, tied to their real data and follower count>",
   "stats": [
-    {"label": "Engagement Rate", "value": "<string>", "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Growth Potential", "value": "<string>", "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Content Score", "value": "<string>", "score": <0-100>, "insight": "<one sentence>"},
-    {"label": "Posting Consistency", "value": "<string>", "score": <0-100>, "insight": "<one sentence>"}
+    {"label": "Engagement Rate", "value": "${engRate || 'calculated'}", "score": <0-100>, "insight": "<specific insight based on their real engagement number vs ${niche} niche average>"},
+    {"label": "Growth Potential", "value": "<string>", "score": <0-100>, "insight": "<specific to their current follower count and niche>"},
+    {"label": "Content Score", "value": "<string>", "score": <0-100>, "insight": "<specific to ${niche} content standards>"},
+    {"label": "Posting Consistency", "value": "<string>", "score": <0-100>, "insight": "<based on their real post count of ${postsCount || 'unknown'} posts>"}
   ],
-  "strengths": ["<3-4 specific strengths based on their data>"],
-  "quickWins": ["<3 specific things to do this week for immediate growth>"]
+  "strengths": ["<3-4 specific strengths drawn from their REAL follower count, engagement, bio, and verified status>"],
+  "quickWins": ["<3 specific things to do THIS WEEK with exact actions and numbers, not vague advice>"]
 }
 
-Rules: viralContentIdeas must have exactly 5 items. viralHooks must have exactly 10 strings. hashtagPack.large must have 5, medium must have 10, niche must have 15. All hashtags must include the # symbol.`;
+Rules: viralContentIdeas must have exactly 5 items, each specific to ${niche}. viralHooks must have exactly 10 strings. hashtagPack.large must have 5, medium must have 10, niche must have 15. All hashtags must include the # symbol. Every insight must reference their actual data, not generic advice.`;
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
