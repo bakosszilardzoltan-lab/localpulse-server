@@ -92,22 +92,107 @@ app.post('/generate', async (req, res) => {
     res.json({ text: data.choices?.[0]?.message?.content || '' });
   } catch(e) { res.json({ text: 'Error: ' + e.message }); }
 });
-app.post('/analyze-instagram', async (req, res) => {
-  const { handle, followers, niche, avg_likes, frequency, bio } = req.body;
+async function fetchInstagramData(handle) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 55000);
+  try {
+    const r = await fetch(
+      `https://api.apify.com/v2/acts/shu8hvrXbJbY3Eb9W/run-sync-get-dataset-items?token=${process.env.APIFY_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          directUrls: [`https://www.instagram.com/${handle}/`],
+          resultsType: 'details',
+          resultsLimit: 1,
+        }),
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeout);
+    const items = await r.json();
+    if (!Array.isArray(items) || !items.length) return null;
+    const p = items[0];
+    const followersCount = p.followersCount || 0;
+    const posts = p.latestPosts || p.posts || [];
+    const likesArr = posts.map(post => post.likesCount || 0).filter(n => n > 0);
+    const avgLikes = likesArr.length
+      ? Math.round(likesArr.reduce((a, b) => a + b, 0) / likesArr.length)
+      : null;
+    const viewsArr = posts.map(post => post.videoViewCount || 0).filter(n => n > 0);
+    const avgViews = viewsArr.length
+      ? Math.round(viewsArr.reduce((a, b) => a + b, 0) / viewsArr.length)
+      : null;
+    const engagementRate = followersCount && avgLikes
+      ? ((avgLikes / followersCount) * 100).toFixed(2) + '%'
+      : null;
+    return {
+      username: p.username,
+      fullName: p.fullName,
+      biography: p.biography,
+      followersCount: p.followersCount,
+      followingCount: p.followingCount,
+      postsCount: p.postsCount,
+      profilePicUrl: p.profilePicUrlHD || p.profilePicUrl,
+      isVerified: p.verified || p.isVerified || false,
+      avgLikes,
+      avgViews,
+      engagementRate,
+    };
+  } catch {
+    clearTimeout(timeout);
+    return null;
+  }
+}
+
+app.post('/instagram-real-data', async (req, res) => {
+  const { handle } = req.body;
   if (!handle) return res.status(400).json({ error: 'handle is required' });
-  if (!followers) return res.status(400).json({ error: 'followers is required' });
+  const clean = handle.replace(/^@/, '').trim();
+  try {
+    const profile = await fetchInstagramData(clean);
+    if (!profile) return res.status(404).json({ error: 'Could not fetch profile data from Apify' });
+    res.json(profile);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/analyze-instagram', async (req, res) => {
+  const { handle, niche, realData } = req.body;
+  if (!handle) return res.status(400).json({ error: 'handle is required' });
   if (!niche) return res.status(400).json({ error: 'niche is required' });
   const clean = handle.replace(/^@/, '').trim();
-  const avgLikesLine = avg_likes ? `- Avg likes per post: ${avg_likes} (engagement rate: ${((avg_likes / followers) * 100).toFixed(2)}%)` : `- Avg likes per post: not provided (estimate based on niche averages)`;
-  const freqLine = frequency ? `- Posting frequency: ${frequency}` : `- Posting frequency: unknown`;
-  const bioLine = bio ? `- Bio/description: ${bio}` : `- Bio/description: not provided`;
+
+  let profile = realData || null;
+  if (!profile) {
+    profile = await fetchInstagramData(clean);
+  }
+
+  const followers    = profile?.followersCount ?? null;
+  const avgLikes     = profile?.avgLikes       ?? null;
+  const bio          = profile?.biography      ?? null;
+  const isVerified   = profile?.isVerified     ?? false;
+  const postsCount   = profile?.postsCount     ?? null;
+  const engRate      = profile?.engagementRate ?? null;
+  const dataNote     = profile ? 'REAL scraped data from Apify' : 'estimated — Apify unavailable';
+
+  const followersLine  = followers  ? `- Followers: ${followers.toLocaleString()} (${dataNote})` : `- Followers: unknown (estimate from niche averages)`;
+  const avgLikesLine   = avgLikes && followers
+    ? `- Avg likes per post: ${avgLikes} (engagement rate: ${engRate || ((avgLikes / followers) * 100).toFixed(2) + '%'}) (${dataNote})`
+    : `- Avg likes per post: estimate based on niche averages`;
+  const bioLine        = bio        ? `- Bio/description: ${bio} (${dataNote})` : `- Bio/description: not provided`;
+  const verifiedLine   = isVerified ? `- Account is VERIFIED (blue checkmark — factor this into monetization potential)` : '';
+  const postsLine      = postsCount ? `- Total posts published: ${postsCount}` : '';
+
   const prompt = `You are an elite social media growth strategist. Based on this account data:
 - Handle: @${clean}
-- Followers: ${followers}
 - Niche: ${niche}
+${followersLine}
 ${avgLikesLine}
-${freqLine}
 ${bioLine}
+${verifiedLine}
+${postsLine}
 
 Generate a highly personalized growth strategy. Be specific to their niche, follower count, and engagement level. Return ONLY a JSON object:
 
