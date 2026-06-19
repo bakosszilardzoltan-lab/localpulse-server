@@ -92,6 +92,31 @@ app.post('/generate', async (req, res) => {
     res.json({ text: data.choices?.[0]?.message?.content || '' });
   } catch(e) { res.json({ text: 'Error: ' + e.message }); }
 });
+function calculatePostingConsistency(posts) {
+  const timestamps = posts.map(p => p.timestamp ? new Date(p.timestamp).getTime() : null).filter(Boolean).sort((a, b) => a - b);
+  if (timestamps.length < 2) return null;
+
+  const daysSpan = (timestamps[timestamps.length - 1] - timestamps[0]) / 86400000;
+  const gaps = [];
+  for (let i = 1; i < timestamps.length; i++) gaps.push((timestamps[i] - timestamps[i - 1]) / 86400000);
+  const avgGapDays = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+  const meanGap = avgGapDays;
+  const variance = gaps.reduce((sum, g) => sum + (g - meanGap) ** 2, 0) / gaps.length;
+  const stdGap = Math.sqrt(variance);
+  const cv = meanGap > 0 ? stdGap / meanGap : 0; // coefficient of variation — lower = more regular timing
+
+  // Frequency: posting roughly daily scores highest, tapering off as the gap widens.
+  const frequencyScore = Math.max(0, Math.min(100, 100 - (avgGapDays - 1) * 8));
+  // Regularity: low variance between gaps scores highest.
+  const regularityScore = Math.max(0, Math.min(100, 100 - cv * 60));
+  const score = Math.round(frequencyScore * 0.6 + regularityScore * 0.4);
+
+  const regularityLabel = cv < 0.4 ? 'fairly consistent timing' : cv < 0.8 ? 'somewhat irregular timing' : 'highly irregular timing';
+  const label = `Posted ${timestamps.length} times in the last ${Math.round(daysSpan)} days — averaging once every ${avgGapDays.toFixed(1)} days, ${regularityLabel}`;
+
+  return { score, label, postsAnalyzed: timestamps.length, daysSpan: Math.round(daysSpan), avgGapDays: Number(avgGapDays.toFixed(1)) };
+}
+
 async function fetchInstagramData(handle) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 55000);
@@ -119,13 +144,30 @@ async function fetchInstagramData(handle) {
     const avgLikes = likesArr.length
       ? Math.round(likesArr.reduce((a, b) => a + b, 0) / likesArr.length)
       : null;
+    const commentsArr = posts.map(post => post.commentsCount || 0).filter(n => n > 0);
+    const avgComments = commentsArr.length
+      ? Math.round(commentsArr.reduce((a, b) => a + b, 0) / commentsArr.length)
+      : null;
     const viewsArr = posts.map(post => post.videoViewCount || 0).filter(n => n > 0);
     const avgViews = viewsArr.length
       ? Math.round(viewsArr.reduce((a, b) => a + b, 0) / viewsArr.length)
       : null;
-    const engagementRate = followersCount && avgLikes
-      ? ((avgLikes / followersCount) * 100).toFixed(2) + '%'
+    // Engagement rate = (avg likes + avg comments) / followers. Apify's instagram-scraper
+    // actor never exposes save/share counts on a post — Instagram only surfaces those to
+    // the account owner via native Insights — so they're excluded here, not omitted by mistake.
+    const engagementRateRaw = followersCount && avgLikes
+      ? ((avgLikes + (avgComments || 0)) / followersCount) * 100
       : null;
+    const engagementRate = engagementRateRaw != null ? engagementRateRaw.toFixed(2) + '%' : null;
+    // Real-world Instagram ER rarely exceeds ~15%, even for tiny, highly-engaged accounts.
+    // Anything above that is flagged so the UI can show the result isn't being presented
+    // as a typical/reproducible number.
+    const ENGAGEMENT_OUTLIER_THRESHOLD = 15;
+    const engagementOutlier = engagementRateRaw != null && engagementRateRaw > ENGAGEMENT_OUTLIER_THRESHOLD;
+    const engagementOutlierNote = engagementOutlier
+      ? 'This engagement rate is unusually high — results may reflect a small, highly engaged audience or unusual post timing. Treat as informational, not a guarantee of broader appeal.'
+      : null;
+    const postingConsistency = calculatePostingConsistency(posts);
     return {
       username: p.username,
       fullName: p.fullName,
@@ -136,8 +178,13 @@ async function fetchInstagramData(handle) {
       profilePicUrl: p.profilePicUrlHD || p.profilePicUrl,
       isVerified: p.verified || p.isVerified || false,
       avgLikes,
+      avgComments,
       avgViews,
       engagementRate,
+      engagementRateRaw,
+      postingConsistency,
+      engagementOutlier,
+      engagementOutlierNote,
     };
   } catch {
     clearTimeout(timeout);
@@ -177,10 +224,10 @@ app.post('/analyze-instagram', async (req, res) => {
   const engRate      = profile?.engagementRate ?? null;
   const dataNote     = profile ? 'REAL scraped data from Apify' : 'estimated — Apify unavailable';
 
-  const followersLine  = followers  ? `- Followers: ${followers.toLocaleString()} (${dataNote})` : `- Followers: unknown (estimate from niche averages)`;
+  const followersLine  = followers  ? `- Followers: ${followers.toLocaleString()} (${dataNote})` : `- Followers: not available — do not invent a specific number, use general guidance instead`;
   const avgLikesLine   = avgLikes && followers
     ? `- Avg likes per post: ${avgLikes} (engagement rate: ${engRate || ((avgLikes / followers) * 100).toFixed(2) + '%'}) (${dataNote})`
-    : `- Avg likes per post: estimate based on niche averages`;
+    : `- Avg likes per post: not available — do not invent a specific number, use general guidance instead`;
   const bioLine        = bio        ? `- Bio/description: ${bio} (${dataNote})` : `- Bio/description: not provided`;
   const verifiedLine   = isVerified ? `- Account is VERIFIED (blue checkmark — factor this into monetization potential)` : '';
   const postsLine      = postsCount ? `- Total posts published: ${postsCount}` : '';
@@ -227,7 +274,7 @@ Generate a hyper-specific, actionable growth strategy for 2026. Return ONLY a JS
   "bestPostingTimes": "<specific days and times based on ${niche} audience behavior in 2026>",
   "todayAction": "<ONE very specific thing they can do TODAY — not vague, tied to their real data and follower count>",
   "stats": [
-    {"label": "Engagement Rate", "value": "${engRate || 'calculated'}", "score": <0-100>, "insight": "<specific insight based on their real engagement number vs ${niche} niche average>"},
+    {"label": "Engagement Rate", "value": "${engRate || 'calculated'}", "score": <0-100>, "insight": "<specific insight based on their real engagement number — do not cite a specific niche-average percentage>"},
     {"label": "Growth Potential", "value": "<string>", "score": <0-100>, "insight": "<specific to their current follower count and niche>"},
     {"label": "Content Score", "value": "<string>", "score": <0-100>, "insight": "<specific to ${niche} content standards>"},
     {"label": "Posting Consistency", "value": "<string>", "score": <0-100>, "insight": "<based on their real post count of ${postsCount || 'unknown'} posts>"}
@@ -236,7 +283,7 @@ Generate a hyper-specific, actionable growth strategy for 2026. Return ONLY a JS
   "quickWins": ["<3 specific things to do THIS WEEK with exact actions and numbers, not vague advice>"]
 }
 
-Rules: viralContentIdeas must have exactly 5 items, each specific to ${niche}. viralHooks must have exactly 10 strings. hashtagPack.large must have 5, medium must have 10, niche must have 15. All hashtags must include the # symbol. Every insight must reference their actual data, not generic advice.`;
+Rules: viralContentIdeas must have exactly 5 items, each specific to ${niche}. viralHooks must have exactly 10 strings. hashtagPack.large must have 5, medium must have 10, niche must have 15. All hashtags must include the # symbol. Every insight must reference their actual data, not generic advice. Never state a specific niche-average engagement rate percentage (e.g. "DJ accounts average 3-5% ER") anywhere in your response — that figure is not real data, it's a recalled approximation. If you need to characterize an engagement rate as good or bad, use general, defensible framing such as "engagement rates above 3% are generally considered strong for most account sizes" instead of a niche-specific number.`;
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -256,6 +303,19 @@ Rules: viralContentIdeas must have exactly 5 items, each specific to ${niche}. v
     try {
       const match = raw.match(/\{[\s\S]*\}/);
       const result = JSON.parse(match ? match[0] : raw);
+      // Posting Consistency must reflect real post timestamps, not an LLM guess — overwrite
+      // whatever the model produced with the backend-computed value, or drop it entirely if
+      // we don't have enough timestamp data to compute one honestly.
+      if (Array.isArray(result.stats)) {
+        const idx = result.stats.findIndex(s => s.label === 'Posting Consistency');
+        if (profile?.postingConsistency) {
+          const pc = profile.postingConsistency;
+          const entry = { label: 'Posting Consistency', value: `${pc.avgGapDays}d avg gap`, score: pc.score, insight: pc.label };
+          if (idx >= 0) result.stats[idx] = entry; else result.stats.push(entry);
+        } else if (idx >= 0) {
+          result.stats.splice(idx, 1);
+        }
+      }
       res.json(result);
     } catch (e) {
       res.status(500).json({ error: 'Failed to parse analysis JSON', raw });
