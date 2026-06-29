@@ -5,7 +5,7 @@ app.use(cors());
 app.use(express.json());
 
 const GOOGLE_PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
-const DETAIL_FIELDS = 'id,displayName,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,regularOpeningHours,types,reviews';
+const DETAIL_FIELDS = 'id,displayName,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,regularOpeningHours,types,primaryType,reviews,photos,location';
 const SEARCH_FIELD_MASK = DETAIL_FIELDS.split(',').map(f => `places.${f}`).join(',');
 
 function formatPlace(place) {
@@ -19,6 +19,9 @@ function formatPlace(place) {
     websiteUri: place.websiteUri,
     regularOpeningHours: place.regularOpeningHours,
     types: place.types,
+    primaryType: place.primaryType || null,
+    photoName: place.photos?.[0]?.name || null,
+    location: place.location ? { lat: place.location.latitude, lng: place.location.longitude } : null,
     reviews: (place.reviews || []).slice(0, 5).map(r => ({
       author: r.authorAttribution?.displayName,
       rating: r.rating,
@@ -515,6 +518,36 @@ app.post('/autocomplete-cities', async (req, res) => {
       secondaryText: s.placePrediction?.structuredFormat?.secondaryText?.text,
     })).filter(s => s.text);
     res.json({ suggestions });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/static-map', async (req, res) => {
+  const { lat, lng, zoom = '15', size = '300x150' } = req.query;
+  if (!lat || !lng) return res.status(400).send('lat and lng are required');
+  try {
+    const mapUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=${zoom}&size=${size}&markers=color:0x00E5C4|${lat},${lng}&key=${GOOGLE_PLACES_KEY}`;
+    const r = await fetch(mapUrl);
+    if (!r.ok) return res.status(r.status).send('Map fetch failed');
+    res.set('Content-Type', r.headers.get('content-type') || 'image/png');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
+app.post('/place-photo', async (req, res) => {
+  const { photoName } = req.body;
+  if (!photoName) return res.status(400).json({ error: 'photoName is required' });
+  try {
+    const r = await fetch(
+      `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=600&skipHttpRedirect=true&key=${GOOGLE_PLACES_KEY}`
+    );
+    const d = await r.json();
+    if (d.error) return res.status(500).json({ error: d.error.message || 'Photo API error' });
+    res.json({ photoUri: d.photoUri || null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
