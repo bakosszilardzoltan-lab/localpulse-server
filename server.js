@@ -495,5 +495,30 @@ app.post('/find-place', async (req, res) => {
   }
 });
 
+app.post('/autocomplete-cities', async (req, res) => {
+  const { input, countryCode } = req.body;
+  if (!input) return res.status(400).json({ error: 'input is required' });
+  try {
+    const body = { input, includedPrimaryTypes: ['locality'] };
+    if (countryCode) body.includedRegionCodes = [countryCode.toLowerCase()];
+    const r = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GOOGLE_PLACES_KEY },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.error) return res.status(500).json({ error: d.error.message || 'Places API error' });
+    const suggestions = (d.suggestions || []).map(s => ({
+      placeId: s.placePrediction?.placeId,
+      text: s.placePrediction?.text?.text,
+      mainText: s.placePrediction?.structuredFormat?.mainText?.text,
+      secondaryText: s.placePrediction?.structuredFormat?.secondaryText?.text,
+    })).filter(s => s.text);
+    res.json({ suggestions });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
