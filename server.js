@@ -216,6 +216,89 @@ app.post('/generate-audit', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// Structured JSON sibling of /generate, used only by the SEO Keywords tool
+// (ToolPage.js tool.id === 'keywords'). Builds the prompt server-side (unlike
+// /generate, which takes a prebuilt prompt) so the schema/rules live in one
+// place and stay in sync with the retry/parse logic below.
+function buildSeoKeywordsPrompt({ business, type, city, country }) {
+  const location = [city, country].filter(Boolean).join(', ');
+  const system = `You are a local SEO keyword research API. Respond ONLY with a single valid JSON object matching the schema below. No markdown code fences, no preamble, no commentary, no assumptions or caveats about missing inputs — business, type and city are always provided.
+
+Schema:
+{
+  "clusters": [
+    { "id": "primary" | "longtail" | "questions" | "local_language",
+      "name": string,
+      "keywords": [ { "keyword": string, "intent": "transactional" | "informational" | "navigational", "competition": "low" | "medium" | "high", "tip": string } ]
+    }
+  ],
+  "gbp_categories": [string],
+  "summary": string
+}
+
+Rules:
+- Include ALL FOUR clusters, always, in this order: "primary" (5-8 keywords), "longtail" (6-10 keywords), "questions" (5-8 keywords), "local_language" (5-8 keywords).
+- The "local_language" cluster's "name" and every one of its "keyword" values must be written in the primary local language spoken in ${country || 'the business location'} (e.g. Romanian for Romania, French for France). Every other cluster's "name" and keywords stay in English.
+- "name" is a short display name, e.g. "Primary Keywords", "Long-Tail Keywords", "Question Keywords", or the local-language cluster's name translated into that same local language.
+- Each keyword's "tip" is a single sentence, max 90 characters, explaining how to use that keyword.
+- "gbp_categories" has at most 3 real, valid Google Business Profile category names relevant to this business.
+- "summary" is at most 2 sentences.
+- Never include search volume numbers or numeric difficulty scores anywhere — competition is qualitative only (low/medium/high), nothing else.`;
+
+  const user = `Business: "${business}"\nBusiness type: ${type}\nLocation: ${location}\n\nGenerate the full local SEO keyword research JSON for this business per the system schema.`;
+  return { system, user };
+}
+
+function parseSeoKeywordsJson(raw) {
+  const stripped = String(raw || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+  const match = stripped.match(/\{[\s\S]*\}/);
+  return JSON.parse(match ? match[0] : stripped);
+}
+
+app.post('/generate-seo-keywords', async (req, res) => {
+  const { business, type, city, country } = req.body;
+  if (!business || !type || !city) {
+    return res.status(400).json({ error: 'business, type and city are required' });
+  }
+  const { system, user } = buildSeoKeywordsPrompt({ business, type, city, country });
+
+  const callGroq = async () => {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 2200,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user',   content: user },
+        ],
+      }),
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+  };
+
+  try {
+    let raw = await callGroq();
+    try {
+      return res.json(parseSeoKeywordsJson(raw));
+    } catch {
+      // One retry — Groq occasionally wraps JSON in commentary despite
+      // response_format: json_object; a second call usually self-corrects.
+      raw = await callGroq();
+      try {
+        return res.json(parseSeoKeywordsJson(raw));
+      } catch {
+        return res.status(502).json({ error: 'Could not generate keywords right now — please try again.' });
+      }
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 function calculatePostingConsistency(posts) {
   const timestamps = posts.map(p => p.timestamp ? new Date(p.timestamp).getTime() : null).filter(Boolean).sort((a, b) => a - b);
   if (timestamps.length < 2) return null;
