@@ -1,8 +1,60 @@
 const express = require('express');
 const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Same anon-key, no-auth-bridge trust model as the frontend's existing
+// Supabase writes to `generations` -- there is no Clerk<->Supabase JWT
+// integration, so user_id is a client-supplied value, not verified here.
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+  : null;
+if (!supabase) console.warn('SUPABASE_URL/SUPABASE_ANON_KEY not set — snapshot features disabled');
+
+function toNumber(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  const n = parseFloat(String(v).replace(/[^0-9.-]/g, ''));
+  return isFinite(n) ? n : null;
+}
+
+function slugify(s) {
+  return String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function normalizeText(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// Approximate text-similarity match for AI-generated recommendation strings.
+// There's no stable per-recommendation ID from the LLM across separate runs,
+// so this is a normalized-word Jaccard-overlap heuristic (v1) used to guess
+// "still open" vs "resolved" -- not exact tracking, don't treat it as one.
+function textSimilar(a, b) {
+  const na = normalizeText(a), nb = normalizeText(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const wa = new Set(na.split(' ').filter(Boolean));
+  const wb = new Set(nb.split(' ').filter(Boolean));
+  let overlap = 0;
+  wa.forEach(w => { if (wb.has(w)) overlap++; });
+  const union = new Set([...wa, ...wb]).size;
+  return union > 0 && overlap / union > 0.6;
+}
+
+async function insertSnapshot({ user_id, tool_name, stable_key, metrics, recommendations }) {
+  if (!supabase || !user_id || !stable_key) return;
+  try {
+    const { error } = await supabase.from('audit_snapshots').insert({
+      user_id, tool_name, stable_key, metrics, recommendations, generation_id: null,
+    });
+    if (error) console.error(`audit_snapshots insert failed (${tool_name}):`, error.message);
+  } catch (e) {
+    console.error(`audit_snapshots insert threw (${tool_name}):`, e.message);
+  }
+}
 
 const GOOGLE_PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const DETAIL_FIELDS = 'id,displayName,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,regularOpeningHours,types,primaryType,reviews,photos,location';
@@ -94,6 +146,68 @@ app.post('/generate', async (req, res) => {
     const data = await response.json();
     res.json({ text: data.choices?.[0]?.message?.content || '' });
   } catch(e) { res.json({ text: 'Error: ' + e.message }); }
+});
+
+// Structured JSON sibling of /generate, used only by the Business Audit tool
+// (ToolPage.js tool.id === 'audit') so the other 5 free-text tools sharing
+// /generate are untouched. Mirrors /analyze-instagram's Groq call shape.
+app.post('/generate-audit', async (req, res) => {
+  try {
+    let prompt = req.body.prompt;
+    const { placeData, business, user_id } = req.body;
+    if (placeData) {
+      prompt = `Here is REAL data for this business from Google: name=${placeData.name}, rating=${placeData.rating}, reviews=${placeData.userRatingCount}, address=${placeData.formattedAddress}. Use this real data in your analysis.\n\n${prompt}`;
+    }
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 1500,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'You are a JSON-only API. Always respond with a single valid JSON object and nothing else.' },
+          { role: 'user',   content: prompt },
+        ],
+      }),
+    });
+    const data = await response.json();
+    const raw = data.choices?.[0]?.message?.content || '';
+    let result;
+    try {
+      const match = raw.match(/\{[\s\S]*\}/);
+      result = JSON.parse(match ? match[0] : raw);
+    } catch (e) {
+      return res.status(500).json({ error: 'Failed to parse audit JSON', raw });
+    }
+
+    // Stable key: prefer the real Google Place ID; fall back to a slug of the
+    // typed business name when the user skipped the Google lookup entirely.
+    // The slug fallback won't reliably match re-entries with typos/renames —
+    // that's a known, accepted v1 limitation, not an oversight.
+    const stableKey = placeData?.placeId || (business ? `manual-${slugify(business)}` : null);
+
+    await insertSnapshot({
+      user_id,
+      tool_name: 'business_audit',
+      stable_key: stableKey,
+      metrics: {
+        overallScore: toNumber(result.overallScore),
+        rating: placeData?.rating != null ? toNumber(placeData.rating) : null,
+        userRatingCount: placeData?.userRatingCount != null ? toNumber(placeData.userRatingCount) : null,
+      },
+      recommendations: [
+        ...(result.criticalIssues || []).map(c => ({ id: c.id, text: c.text, category: 'critical' })),
+        ...(result.quickWins || []).map(q => ({ id: q.id, text: q.text, category: 'quickwin' })),
+      ],
+    });
+
+    // _stableKey is server-added metadata (not part of the AI schema) so the
+    // frontend knows what key to pass to /snapshot-delta next.
+    res.json({ ...result, _stableKey: stableKey });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 function calculatePostingConsistency(posts) {
   const timestamps = posts.map(p => p.timestamp ? new Date(p.timestamp).getTime() : null).filter(Boolean).sort((a, b) => a - b);
@@ -209,7 +323,7 @@ app.post('/instagram-real-data', async (req, res) => {
 });
 
 app.post('/analyze-instagram', async (req, res) => {
-  const { handle, niche, realData } = req.body;
+  const { handle, niche, realData, user_id } = req.body;
   if (!handle) return res.status(400).json({ error: 'handle is required' });
   if (!niche) return res.status(400).json({ error: 'niche is required' });
   const clean = handle.replace(/^@/, '').trim();
@@ -319,10 +433,91 @@ Rules: viralContentIdeas must have exactly 5 items, each specific to ${niche}. v
           result.stats.splice(idx, 1);
         }
       }
+      // Snapshot for delta tracking — awaited (it's a single fast insert) so the
+      // very next /snapshot-delta call from the frontend sees this run's row,
+      // but wrapped so a Supabase failure never breaks the analysis response.
+      await insertSnapshot({
+        user_id,
+        tool_name: 'instagram',
+        stable_key: clean,
+        metrics: {
+          followersCount:  toNumber(profile?.followersCount),
+          followingCount:  toNumber(profile?.followingCount),
+          postsCount:      toNumber(profile?.postsCount),
+          engagementRate:  toNumber(profile?.engagementRateRaw ?? result.engagementRate),
+          avgLikes:        toNumber(profile?.avgLikes),
+          avgComments:     toNumber(profile?.avgComments),
+          avgViews:        toNumber(profile?.avgViews),
+          growthRate:      toNumber(result.growthRate),
+        },
+        recommendations: [
+          ...(result.strengths || []).map((text, i) => ({ id: `strength-${i}`, text, category: 'strength' })),
+          ...(result.quickWins || []).map((text, i) => ({ id: `quickwin-${i}`, text, category: 'quickwin' })),
+        ],
+      });
       res.json(result);
     } catch (e) {
       res.status(500).json({ error: 'Failed to parse analysis JSON', raw });
     }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Generic across tools by (user_id, tool_name, stable_key) — used by both
+// Instagram and Business Audit; TikTok/YouTube can reuse it later unchanged.
+app.get('/snapshot-delta', async (req, res) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+  const { stable_key, tool_name, user_id } = req.query;
+  if (!stable_key || !tool_name || !user_id) {
+    return res.status(400).json({ error: 'stable_key, tool_name and user_id are required' });
+  }
+  try {
+    const { data: rows, error } = await supabase
+      .from('audit_snapshots')
+      .select('created_at, metrics, recommendations')
+      .eq('user_id', user_id)
+      .eq('tool_name', tool_name)
+      .eq('stable_key', stable_key)
+      .order('created_at', { ascending: false })
+      .limit(2);
+    if (error) throw new Error(error.message);
+
+    const current = rows?.[0] || null;
+    const previous = rows?.[1] || null;
+
+    let metricDeltas = [];
+    if (current && previous) {
+      const keys = new Set([...Object.keys(current.metrics || {}), ...Object.keys(previous.metrics || {})]);
+      metricDeltas = [...keys].map(key => {
+        const currentValue = toNumber(current.metrics?.[key]);
+        const previousValue = toNumber(previous.metrics?.[key]);
+        const hasBoth = currentValue != null && previousValue != null;
+        const change = hasBoth ? currentValue - previousValue : null;
+        const changePercent = hasBoth && previousValue !== 0 ? (change / previousValue) * 100 : null;
+        return { key, previousValue, currentValue, change, changePercent };
+      });
+    }
+
+    const recommendationChanges = { stillOpen: [], resolved: [] };
+    if (current && previous) {
+      const currentRecs = current.recommendations || [];
+      const previousRecs = previous.recommendations || [];
+      recommendationChanges.stillOpen = currentRecs.filter(c =>
+        previousRecs.some(p => p.category === c.category && textSimilar(p.text, c.text))
+      );
+      recommendationChanges.resolved = previousRecs.filter(p =>
+        !currentRecs.some(c => c.category === p.category && textSimilar(c.text, p.text))
+      );
+    }
+
+    res.json({
+      hasPrevious: !!previous,
+      previous: previous ? { created_at: previous.created_at, metrics: previous.metrics } : null,
+      current: current ? { created_at: current.created_at, metrics: current.metrics } : null,
+      metricDeltas,
+      recommendationChanges,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
