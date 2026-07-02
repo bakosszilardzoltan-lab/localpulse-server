@@ -44,12 +44,18 @@ function requireOwnerAuth(req, res, next) {
     clerkMiddleware({ publishableKey: CLERK_PUBLISHABLE_KEY })(req, res, (err) => (err ? reject(err) : resolve()));
   })
     .then(() => {
-      const { userId } = getAuth(req);
-      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+      const { userId, tokenType, reason, message } = getAuth(req);
+      if (!userId) {
+        console.warn(`[requireOwnerAuth] ${req.method} ${req.path}: no userId after clerkMiddleware — tokenType=${tokenType} reason=${reason} message=${message}`);
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
       req.ownerUserId = userId;
       next();
     })
-    .catch(() => res.status(401).json({ error: 'Unauthorized' }));
+    .catch((err) => {
+      console.error(`[requireOwnerAuth] ${req.method} ${req.path}: clerkMiddleware threw — name=${err?.name} message=${err?.message} reason=${err?.reason}`);
+      res.status(401).json({ error: 'Unauthorized' });
+    });
 }
 
 // Simple in-memory per-token rate limiter for the no-auth magic-link routes,
