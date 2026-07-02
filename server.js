@@ -7,6 +7,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Diagnostic only -- logs the first 10 chars of the secret key actually
+// loaded into this process's env at boot, to confirm which key a running
+// container has (Railway variable edits don't hot-reload into an already
+// running process; only a fresh boot picks up the new value).
+console.log('[boot] CLERK_SECRET_KEY prefix:', (process.env.CLERK_SECRET_KEY || '(unset)').slice(0, 10));
+
 // Same anon-key, no-auth-bridge trust model as the frontend's existing
 // Supabase writes to `generations` -- there is no Clerk<->Supabase JWT
 // integration, so user_id is a client-supplied value, not verified here.
