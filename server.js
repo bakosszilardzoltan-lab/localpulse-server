@@ -57,7 +57,7 @@ async function insertSnapshot({ user_id, tool_name, stable_key, metrics, recomme
 }
 
 const GOOGLE_PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
-const DETAIL_FIELDS = 'id,displayName,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,regularOpeningHours,types,primaryType,reviews,photos,location';
+const DETAIL_FIELDS = 'id,displayName,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,regularOpeningHours,types,primaryType,reviews,photos,location,googleMapsUri,priceLevel,businessStatus';
 const SEARCH_FIELD_MASK = DETAIL_FIELDS.split(',').map(f => `places.${f}`).join(',');
 
 function formatPlace(place) {
@@ -74,11 +74,18 @@ function formatPlace(place) {
     primaryType: place.primaryType || null,
     photoName: place.photos?.[0]?.name || null,
     location: place.location ? { lat: place.location.latitude, lng: place.location.longitude } : null,
+    googleMapsUri: place.googleMapsUri || null,
+    priceLevel: place.priceLevel || null,
+    businessStatus: place.businessStatus || null,
+    // Only these fields are ever forwarded to the client -- do not widen
+    // this without checking Google's Places API attribution/ToS terms.
     reviews: (place.reviews || []).slice(0, 5).map(r => ({
-      author: r.authorAttribution?.displayName,
-      rating: r.rating,
-      text: r.text?.text,
-      relativeTime: r.relativePublishTimeDescription,
+      author: r.authorAttribution?.displayName || null,
+      authorPhotoUri: r.authorAttribution?.photoUri || null,
+      rating: r.rating ?? null,
+      text: r.text?.text || null,
+      relativeTime: r.relativePublishTimeDescription || null,
+      publishTime: r.publishTime || null,
     })),
   };
 }
