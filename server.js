@@ -1,6 +1,8 @@
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const { clerkMiddleware, getAuth } = require('@clerk/express');
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -12,6 +14,62 @@ const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY)
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
   : null;
 if (!supabase) console.warn('SUPABASE_URL/SUPABASE_ANON_KEY not set — snapshot features disabled');
+
+// Service-role client for the Review Reply Approval Queue only -- unlike the
+// tables above, review_businesses/review_replies have RLS enabled with no
+// policies, so the anon client can't touch them at all. This client bypasses
+// RLS entirely, which is safe here because every route that uses it either
+// requires a verified Clerk user (owner routes) or a verified magic-link
+// token (approval routes) before ever running a query.
+const supabaseAdmin = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+if (!supabaseAdmin) console.warn('SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not set — review queue disabled');
+
+// Not a secret -- this is the same key already shipped in the frontend's
+// public JS bundle (REACT_APP_CLERK_PUBLISHABLE_KEY). Hardcoded as a fallback
+// so clerkMiddleware works without a new Railway env var; override via
+// CLERK_PUBLISHABLE_KEY if the frontend ever rotates to a different instance.
+const CLERK_PUBLISHABLE_KEY = process.env.CLERK_PUBLISHABLE_KEY
+  || 'pk_test_cHJvdmVuLWthbmdhcm9vLTI0LmNsZXJrLmFjY291bnRzLmRldiQ';
+
+// Verifies the Clerk session token from Authorization: Bearer <token>, scoped
+// to individual routes (not app.use'd globally) so it can't affect any
+// existing endpoint's behavior. clerkMiddleware() throws on a malformed/
+// garbage JWT instead of cleanly no-op'ing, so it's wrapped in a promise and
+// any failure — missing token, garbage token, or expired token — collapses
+// to the same 401 JSON response.
+function requireOwnerAuth(req, res, next) {
+  new Promise((resolve, reject) => {
+    clerkMiddleware({ publishableKey: CLERK_PUBLISHABLE_KEY })(req, res, (err) => (err ? reject(err) : resolve()));
+  })
+    .then(() => {
+      const { userId } = getAuth(req);
+      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+      req.ownerUserId = userId;
+      next();
+    })
+    .catch(() => res.status(401).json({ error: 'Unauthorized' }));
+}
+
+// Simple in-memory per-token rate limiter for the no-auth magic-link routes,
+// which exist specifically to protect Groq API costs from an abused/leaked
+// link. Not distributed -- fine for a single Railway instance.
+const TOKEN_RATE_LIMIT = 60; // requests per hour per token
+const TOKEN_RATE_WINDOW_MS = 60 * 60 * 1000;
+const tokenRequestLog = new Map(); // token -> array of timestamps
+
+function checkTokenRateLimit(token) {
+  const now = Date.now();
+  const timestamps = (tokenRequestLog.get(token) || []).filter(t => now - t < TOKEN_RATE_WINDOW_MS);
+  if (timestamps.length >= TOKEN_RATE_LIMIT) {
+    tokenRequestLog.set(token, timestamps);
+    return false;
+  }
+  timestamps.push(now);
+  tokenRequestLog.set(token, timestamps);
+  return true;
+}
 
 function toNumber(v) {
   if (v == null) return null;
@@ -833,6 +891,350 @@ app.post('/place-photo', async (req, res) => {
     const d = await r.json();
     if (d.error) return res.status(500).json({ error: d.error.message || 'Photo API error' });
     res.json({ photoUri: d.photoUri || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== Review Reply Approval Queue =====
+// Agency drafts AI review replies via Groq; nothing is final until the
+// client approves via a token-based magic link (no account needed).
+
+function buildReviewReplyPrompt({ businessName, businessType, reviewText, reviewAuthor, reviewRating, tone, language, ownerSignName, previousDraft, clientNote }) {
+  const langName = language === 'ro' ? 'Romanian' : 'English';
+  let system = `You are a local business review-reply API. Respond ONLY with a single valid JSON object matching the schema below. No markdown code fences, no preamble, no commentary.
+
+Schema:
+{ "reply": string }
+
+Rules:
+- Base the reply ONLY on the actual content of the review text provided — never invent details, names, or incidents that aren't in the review.
+- Tone: ${tone || 'professional'}.
+- Language: write the entire reply in ${langName}.
+- Length: medium — roughly 2-4 sentences, not a one-liner and not a long essay.
+- ${ownerSignName ? `Sign off naturally as "${ownerSignName}" if a sign-off fits the tone, but don't force it awkwardly.` : 'Do not fabricate a signer name since none was given.'}
+- Never use placeholder brackets like [Business Name] or [Customer Name] — use the real names given, or phrase around it naturally if not given.
+- If the review is negative, acknowledge the concern genuinely without sounding defensive or scripted.`;
+
+  if (previousDraft) {
+    system += `\n\nThis is a REGENERATION request. The previous draft was:\n"${previousDraft}"\nGenerate a DIFFERENT owner response. Do not reuse the phrasing or structure of the previous response.`;
+  }
+  if (clientNote) {
+    system += `\nThe client gave this feedback about the previous draft, follow it: ${clientNote}`;
+  }
+
+  const user = `Business: "${businessName}"${businessType ? ` (${businessType})` : ''}
+Customer review${reviewAuthor ? ` by ${reviewAuthor}` : ''}${reviewRating ? `, rating ${reviewRating}/5` : ''}:
+"${reviewText}"
+
+Write the owner's reply to this review per the system schema.`;
+
+  return { system, user };
+}
+
+function parseReviewReplyJson(raw) {
+  const stripped = String(raw || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+  const match = stripped.match(/\{[\s\S]*\}/);
+  const parsed = JSON.parse(match ? match[0] : stripped);
+  if (!parsed.reply || typeof parsed.reply !== 'string' || !parsed.reply.trim()) throw new Error('missing reply field');
+  return parsed.reply.trim();
+}
+
+async function generateReviewReply(params) {
+  const { system, user } = buildReviewReplyPrompt(params);
+  const callGroq = async () => {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 500,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      }),
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+  };
+
+  let raw = await callGroq();
+  try {
+    return parseReviewReplyJson(raw);
+  } catch {
+    // One retry — Groq occasionally wraps JSON in commentary despite
+    // response_format: json_object; a second call usually self-corrects.
+    raw = await callGroq();
+    return parseReviewReplyJson(raw);
+  }
+}
+
+function publicReplyView(r) {
+  return {
+    id: r.id,
+    reviewText: r.review_text,
+    reviewAuthor: r.review_author,
+    reviewRating: r.review_rating,
+    draftReply: r.draft_reply,
+    status: r.status,
+    regenerationCount: r.regeneration_count,
+    clientNote: r.client_note,
+    createdAt: r.created_at,
+    approvedAt: r.approved_at,
+  };
+}
+
+app.post('/api/review-queue/business', requireOwnerAuth, async (req, res) => {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'Review queue not configured' });
+  const { businessName, businessType, defaultTone, defaultLanguage, ownerSignName } = req.body;
+  if (!businessName || !String(businessName).trim()) {
+    return res.status(400).json({ error: 'businessName is required' });
+  }
+  try {
+    const approvalToken = crypto.randomBytes(24).toString('base64url');
+    const { data, error } = await supabaseAdmin
+      .from('review_businesses')
+      .insert({
+        owner_user_id: req.ownerUserId,
+        business_name: businessName,
+        business_type: businessType || null,
+        default_tone: defaultTone || 'professional',
+        default_language: defaultLanguage || 'en',
+        owner_sign_name: ownerSignName || null,
+        approval_token: approvalToken,
+      })
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+    res.json({ ...data, approvalLinkPath: `/approve/${data.approval_token}` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/review-queue/reviews', requireOwnerAuth, async (req, res) => {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'Review queue not configured' });
+  const { businessId, reviews } = req.body;
+  if (!businessId || !Array.isArray(reviews) || reviews.length === 0 || reviews.length > 20) {
+    return res.status(400).json({ error: 'businessId is required and reviews must be an array of 1-20 items' });
+  }
+  try {
+    const { data: business, error: bizError } = await supabaseAdmin
+      .from('review_businesses')
+      .select('*')
+      .eq('id', businessId)
+      .eq('owner_user_id', req.ownerUserId)
+      .maybeSingle();
+    if (bizError) throw new Error(bizError.message);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+
+    const valid = [];
+    const skipped = [];
+    reviews.forEach((r, idx) => {
+      const reviewText = String(r?.reviewText || '').trim();
+      if (reviewText.length < 10) {
+        skipped.push({ index: idx, reason: 'reviewText must be at least 10 characters' });
+      } else {
+        valid.push({ reviewText, reviewAuthor: r?.reviewAuthor || null, reviewRating: toNumber(r?.reviewRating) });
+      }
+    });
+
+    const drafted = await Promise.all(valid.map(async (r) => {
+      try {
+        const draftReply = await generateReviewReply({
+          businessName: business.business_name,
+          businessType: business.business_type,
+          reviewText: r.reviewText,
+          reviewAuthor: r.reviewAuthor,
+          reviewRating: r.reviewRating,
+          tone: business.default_tone,
+          language: business.default_language,
+          ownerSignName: business.owner_sign_name,
+        });
+        return { ...r, draftReply };
+      } catch (e) {
+        return { ...r, error: e.message };
+      }
+    }));
+
+    const toInsert = drafted.filter(d => d.draftReply).map(d => ({
+      business_id: businessId,
+      review_text: d.reviewText,
+      review_author: d.reviewAuthor,
+      review_rating: d.reviewRating,
+      draft_reply: d.draftReply,
+      status: 'pending',
+    }));
+    drafted.filter(d => !d.draftReply).forEach(d => skipped.push({ reviewText: d.reviewText, reason: d.error || 'Failed to generate reply' }));
+
+    let created = [];
+    if (toInsert.length > 0) {
+      const { data, error } = await supabaseAdmin.from('review_replies').insert(toInsert).select();
+      if (error) throw new Error(error.message);
+      created = data;
+    }
+
+    res.json({ created: created.map(publicReplyView), skipped });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/review-queue/approval/:token', async (req, res) => {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'Review queue not configured' });
+  const { token } = req.params;
+  if (!checkTokenRateLimit(token)) return res.status(429).json({ error: 'Too many requests, please try again later' });
+  try {
+    const { data: business, error: bizError } = await supabaseAdmin
+      .from('review_businesses')
+      .select('id, business_name, default_language')
+      .eq('approval_token', token)
+      .maybeSingle();
+    if (bizError) throw new Error(bizError.message);
+    if (!business) return res.status(404).json({ error: 'Not found' });
+
+    const { data: replies, error: repError } = await supabaseAdmin
+      .from('review_replies')
+      .select('*')
+      .eq('business_id', business.id)
+      .in('status', ['pending', 'approved', 'posted'])
+      .order('created_at', { ascending: true });
+    if (repError) throw new Error(repError.message);
+
+    const views = (replies || []).map(publicReplyView);
+    res.json({
+      businessName: business.business_name,
+      defaultLanguage: business.default_language,
+      pending: views.filter(v => v.status === 'pending'),
+      approved: views.filter(v => v.status === 'approved'),
+      posted: views.filter(v => v.status === 'posted'),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/review-queue/approval/:token/action', async (req, res) => {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'Review queue not configured' });
+  const { token } = req.params;
+  if (!checkTokenRateLimit(token)) return res.status(429).json({ error: 'Too many requests, please try again later' });
+  const { replyId, action, editedText, note } = req.body;
+  if (!replyId || !['approve', 'regenerate', 'edit', 'skip'].includes(action)) {
+    return res.status(400).json({ error: 'replyId and a valid action are required' });
+  }
+  try {
+    const { data: business, error: bizError } = await supabaseAdmin
+      .from('review_businesses')
+      .select('*')
+      .eq('approval_token', token)
+      .maybeSingle();
+    if (bizError) throw new Error(bizError.message);
+    if (!business) return res.status(404).json({ error: 'Not found' });
+
+    // Critical: verify replyId actually belongs to this token's business —
+    // never trust replyId alone, or any token holder could act on any
+    // business's replies just by guessing/enumerating ids.
+    const { data: reply, error: repError } = await supabaseAdmin
+      .from('review_replies')
+      .select('*')
+      .eq('id', replyId)
+      .eq('business_id', business.id)
+      .maybeSingle();
+    if (repError) throw new Error(repError.message);
+    if (!reply) return res.status(404).json({ error: 'Reply not found' });
+
+    if (action === 'edit') {
+      if (!editedText || !String(editedText).trim()) return res.status(400).json({ error: 'editedText is required' });
+      const { data, error } = await supabaseAdmin
+        .from('review_replies')
+        .update({ draft_reply: editedText })
+        .eq('id', replyId)
+        .select()
+        .single();
+      if (error) throw new Error(error.message);
+      return res.json(publicReplyView(data));
+    }
+
+    if (action === 'approve') {
+      const update = { status: 'approved', approved_at: new Date().toISOString() };
+      if (editedText && String(editedText).trim()) update.draft_reply = editedText;
+      const { data, error } = await supabaseAdmin
+        .from('review_replies')
+        .update(update)
+        .eq('id', replyId)
+        .select()
+        .single();
+      if (error) throw new Error(error.message);
+      return res.json(publicReplyView(data));
+    }
+
+    if (action === 'skip') {
+      const { data, error } = await supabaseAdmin
+        .from('review_replies')
+        .update({ status: 'rejected' })
+        .eq('id', replyId)
+        .select()
+        .single();
+      if (error) throw new Error(error.message);
+      return res.json(publicReplyView(data));
+    }
+
+    // regenerate
+    const newDraft = await generateReviewReply({
+      businessName: business.business_name,
+      businessType: business.business_type,
+      reviewText: reply.review_text,
+      reviewAuthor: reply.review_author,
+      reviewRating: reply.review_rating,
+      tone: business.default_tone,
+      language: business.default_language,
+      ownerSignName: business.owner_sign_name,
+      previousDraft: reply.draft_reply,
+      clientNote: note || null,
+    });
+    const { data, error } = await supabaseAdmin
+      .from('review_replies')
+      .update({
+        draft_reply: newDraft,
+        regeneration_count: (reply.regeneration_count || 0) + 1,
+        client_note: note || reply.client_note,
+      })
+      .eq('id', replyId)
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+    res.json(publicReplyView(data));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/review-queue/mark-posted', requireOwnerAuth, async (req, res) => {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'Review queue not configured' });
+  const { replyId } = req.body;
+  if (!replyId) return res.status(400).json({ error: 'replyId is required' });
+  try {
+    // Owner-only: verify the reply's business is actually owned by this
+    // Clerk user before flipping status, via an inner join on business_id.
+    const { data: reply, error: repError } = await supabaseAdmin
+      .from('review_replies')
+      .select('*, review_businesses!inner(owner_user_id)')
+      .eq('id', replyId)
+      .eq('review_businesses.owner_user_id', req.ownerUserId)
+      .maybeSingle();
+    if (repError) throw new Error(repError.message);
+    if (!reply) return res.status(404).json({ error: 'Reply not found' });
+
+    const { data, error } = await supabaseAdmin
+      .from('review_replies')
+      .update({ status: 'posted' })
+      .eq('id', replyId)
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+    res.json(publicReplyView(data));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
