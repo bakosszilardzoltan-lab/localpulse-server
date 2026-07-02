@@ -131,6 +131,11 @@ const GOOGLE_PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const DETAIL_FIELDS = 'id,displayName,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,regularOpeningHours,types,primaryType,reviews,photos,location,googleMapsUri,priceLevel,businessStatus';
 const SEARCH_FIELD_MASK = DETAIL_FIELDS.split(',').map(f => `places.${f}`).join(',');
 
+// Competitor Spy's "suggested nearby competitors" step — tweak the radius
+// here if 5km turns out too wide/narrow for a given market.
+const NEARBY_COMPETITOR_RADIUS_METERS = 5000;
+const NEARBY_FIELD_MASK = 'places.id,places.displayName,places.rating,places.userRatingCount,places.primaryType,places.photos,places.location';
+
 function formatPlace(place) {
   return {
     placeId: place.id,
@@ -1046,6 +1051,23 @@ app.post('/place-details', async (req, res) => {
   }
 });
 
+// Hydrates a bare placeId into the full formatPlace() shape — used after a
+// Competitor Spy nearby-suggestion tap, since /nearby-competitors only
+// returns a lightweight preview (name/rating/photo) to keep that call cheap,
+// but the confirmation card and /generate-competitor-analysis both need the
+// full detail set (address, website, hours, price level).
+app.post('/place-by-id', async (req, res) => {
+  const { placeId } = req.body;
+  if (!placeId) return res.status(400).json({ error: 'placeId is required' });
+  try {
+    const place = await fetchPlaceById(placeId);
+    if (!place) return res.status(404).json({ error: 'Place not found' });
+    res.json(formatPlace(place));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/find-place', async (req, res) => {
   const { query } = req.body;
   if (!query) return res.status(400).json({ error: 'query is required' });
@@ -1053,6 +1075,58 @@ app.post('/find-place', async (req, res) => {
     const place = await textSearchPlace(query);
     if (!place) return res.status(404).json({ error: 'No places found for that query' });
     res.json(formatPlace(place));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Competitor Spy's auto-suggestion step, once "Your Business" is confirmed.
+// Ranked by prominence (rankPreference: POPULARITY) rather than raw distance,
+// so a well-known competitor a bit further away still surfaces over a
+// nondescript one right next door.
+app.post('/nearby-competitors', async (req, res) => {
+  const { lat, lng, primaryType, excludePlaceId } = req.body;
+  if (lat == null || lng == null) return res.status(400).json({ error: 'lat and lng are required' });
+  try {
+    const body = {
+      maxResultCount: 20, // API max — filtered down to 5 exact-type matches below
+      rankPreference: 'POPULARITY',
+      locationRestriction: {
+        circle: { center: { latitude: Number(lat), longitude: Number(lng) }, radius: NEARBY_COMPETITOR_RADIUS_METERS },
+      },
+    };
+    if (primaryType) body.includedTypes = [primaryType];
+
+    const r = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': GOOGLE_PLACES_KEY,
+        'X-Goog-FieldMask': NEARBY_FIELD_MASK,
+      },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.error) return res.status(500).json({ error: d.error.message || 'Places API error' });
+
+    const results = (d.places || [])
+      // includedTypes above matches ANY of a place's types, not just its
+      // primaryType (e.g. a hotel with an in-house restaurant would match
+      // "restaurant") — this second filter enforces an exact primaryType
+      // match so "nearby competitors" really means same category, not just
+      // same building.
+      .filter(p => p.id !== excludePlaceId && (!primaryType || p.primaryType === primaryType))
+      .slice(0, 5)
+      .map(p => ({
+        placeId: p.id,
+        name: p.displayName?.text ?? p.displayName,
+        rating: p.rating ?? null,
+        userRatingCount: p.userRatingCount ?? null,
+        primaryType: p.primaryType || null,
+        photoName: p.photos?.[0]?.name || null,
+        location: p.location ? { lat: p.location.latitude, lng: p.location.longitude } : null,
+      }));
+    res.json({ results });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
