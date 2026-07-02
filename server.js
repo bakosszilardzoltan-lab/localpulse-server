@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const { clerkMiddleware, getAuth } = require('@clerk/express');
+const { authenticateRequest, clerkClient } = require('@clerk/express');
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -35,27 +35,28 @@ const CLERK_PUBLISHABLE_KEY = process.env.CLERK_PUBLISHABLE_KEY
 
 // Verifies the Clerk session token from Authorization: Bearer <token>, scoped
 // to individual routes (not app.use'd globally) so it can't affect any
-// existing endpoint's behavior. clerkMiddleware() throws on a malformed/
-// garbage JWT instead of cleanly no-op'ing, so it's wrapped in a promise and
-// any failure — missing token, garbage token, or expired token — collapses
-// to the same 401 JSON response.
-function requireOwnerAuth(req, res, next) {
-  new Promise((resolve, reject) => {
-    clerkMiddleware({ publishableKey: CLERK_PUBLISHABLE_KEY })(req, res, (err) => (err ? reject(err) : resolve()));
-  })
-    .then(() => {
-      const { userId, tokenType, reason, message } = getAuth(req);
-      if (!userId) {
-        console.warn(`[requireOwnerAuth] ${req.method} ${req.path}: no userId after clerkMiddleware — tokenType=${tokenType} reason=${reason} message=${message}`);
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-      req.ownerUserId = userId;
-      next();
-    })
-    .catch((err) => {
-      console.error(`[requireOwnerAuth] ${req.method} ${req.path}: clerkMiddleware threw — name=${err?.name} message=${err?.message} reason=${err?.reason}`);
-      res.status(401).json({ error: 'Unauthorized' });
+// existing endpoint's behavior. Calls authenticateRequest() directly (rather
+// than clerkMiddleware()+getAuth()) because the real failure reason/message
+// live on the intermediate requestState and are discarded by the time
+// getAuth() collapses it down to the public auth shape.
+async function requireOwnerAuth(req, res, next) {
+  try {
+    const requestState = await authenticateRequest({
+      clerkClient,
+      request: req,
+      options: { publishableKey: CLERK_PUBLISHABLE_KEY },
     });
+    const userId = requestState.toAuth()?.userId;
+    if (!userId) {
+      console.warn(`[requireOwnerAuth] ${req.method} ${req.path}: status=${requestState.status} reason=${requestState.reason} message=${requestState.message}`);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    req.ownerUserId = userId;
+    next();
+  } catch (err) {
+    console.error(`[requireOwnerAuth] ${req.method} ${req.path}: authenticateRequest threw — name=${err?.name} message=${err?.message}`);
+    res.status(401).json({ error: 'Unauthorized' });
+  }
 }
 
 // Simple in-memory per-token rate limiter for the no-auth magic-link routes,
