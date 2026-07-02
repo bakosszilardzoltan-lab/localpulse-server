@@ -148,6 +148,7 @@ function formatPlace(place) {
     googleMapsUri: place.googleMapsUri || null,
     priceLevel: place.priceLevel || null,
     businessStatus: place.businessStatus || null,
+    photoCount: Array.isArray(place.photos) ? place.photos.length : 0,
     // Only these fields are ever forwarded to the client -- do not widen
     // this without checking Google's Places API attribution/ToS terms.
     reviews: (place.reviews || []).slice(0, 5).map(r => ({
@@ -365,6 +366,209 @@ app.post('/generate-seo-keywords', async (req, res) => {
         return res.status(502).json({ error: 'Could not generate keywords right now — please try again.' });
       }
     }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== Competitor Spy =====
+// Structured JSON sibling of /generate, used only by the Competitor Spy tool
+// (ToolPage.js tool.id === 'competitor'). Both businesses are looked up via
+// Google Places (formatPlace() shape) so every scoreboard row is real data —
+// the scoreboard itself is computed here, not left to the model, and the LLM
+// only supplies the "note" commentary plus the qualitative sections below.
+
+const PRICE_LEVEL_SYMBOL = {
+  PRICE_LEVEL_FREE: 'Free',
+  PRICE_LEVEL_INEXPENSIVE: '$',
+  PRICE_LEVEL_MODERATE: '$$',
+  PRICE_LEVEL_EXPENSIVE: '$$$',
+  PRICE_LEVEL_VERY_EXPENSIVE: '$$$$',
+};
+
+function hoursCoverage(regularOpeningHours) {
+  const desc = regularOpeningHours?.weekdayDescriptions;
+  if (!Array.isArray(desc) || !desc.length) return null;
+  const openDays = desc.filter(d => !/closed/i.test(d)).length;
+  return { openDays, totalDays: desc.length, text: `${openDays}/${desc.length} days open` };
+}
+
+function buildCompetitorFacts(p) {
+  return {
+    name: p?.name || 'Unknown business',
+    type: p?.primaryType || (Array.isArray(p?.types) ? p.types[0] : null) || null,
+    rating: p?.rating != null ? Number(p.rating) : null,
+    userRatingCount: p?.userRatingCount != null ? Number(p.userRatingCount) : null,
+    priceLevel: PRICE_LEVEL_SYMBOL[p?.priceLevel] || null,
+    photoCount: p?.photoCount != null ? Number(p.photoCount) : null,
+    hasWebsite: !!p?.websiteUri,
+    hours: hoursCoverage(p?.regularOpeningHours),
+    address: p?.formattedAddress || null,
+  };
+}
+
+// Fully deterministic — every yours/theirs value and winner comes straight
+// from the Places facts, never from the model, so this table can never
+// contain a hallucinated number.
+function computeScoreboard(yours, theirs) {
+  const numRow = (metric, yv, tv, fmt) => {
+    let winner = 'tie';
+    if (typeof yv === 'number' && typeof tv === 'number') winner = yv > tv ? 'you' : yv < tv ? 'them' : 'tie';
+    else if (typeof yv === 'number' && tv == null) winner = 'you';
+    else if (typeof tv === 'number' && yv == null) winner = 'them';
+    return { metric, yours: fmt(yv), theirs: fmt(tv), winner };
+  };
+
+  return [
+    numRow('Rating', yours.rating, theirs.rating, v => v != null ? v.toFixed(1) : 'Not listed'),
+    numRow('Reviews', yours.userRatingCount, theirs.userRatingCount, v => v != null ? v.toLocaleString() : 'Not listed'),
+    { metric: 'Price level', yours: yours.priceLevel || 'Not listed', theirs: theirs.priceLevel || 'Not listed', winner: 'tie' },
+    numRow('Photos', yours.photoCount, theirs.photoCount, v => v != null ? String(v) : 'Not listed'),
+    {
+      metric: 'Website',
+      yours: yours.hasWebsite ? 'Yes' : 'No',
+      theirs: theirs.hasWebsite ? 'Yes' : 'No',
+      winner: yours.hasWebsite === theirs.hasWebsite ? 'tie' : (yours.hasWebsite ? 'you' : 'them'),
+    },
+    {
+      metric: 'Hours coverage',
+      yours: yours.hours ? yours.hours.text : 'Not listed',
+      theirs: theirs.hours ? theirs.hours.text : 'Not listed',
+      winner: (yours.hours && theirs.hours)
+        ? (yours.hours.openDays === theirs.hours.openDays ? 'tie' : (yours.hours.openDays > theirs.hours.openDays ? 'you' : 'them'))
+        : 'tie',
+    },
+  ];
+}
+
+// Keeps the model's one-line "note" per metric (judgment call) but discards
+// anything it wrote for yours/theirs/winner in favor of the computed truth
+// above — same overwrite idiom used for Instagram's Posting Consistency stat.
+function mergeScoreboard(computedRows, llmRows) {
+  const byMetric = new Map((Array.isArray(llmRows) ? llmRows : []).map(r => [String(r?.metric || '').toLowerCase(), r]));
+  return computedRows.map(row => {
+    const llm = byMetric.get(row.metric.toLowerCase());
+    return { ...row, note: (llm && typeof llm.note === 'string') ? llm.note : '' };
+  });
+}
+
+function buildCompetitorFactsBlock(label, f) {
+  return `${label}:
+- Name: ${f.name}
+- Category: ${f.type || 'Not listed'}
+- Rating: ${f.rating != null ? f.rating.toFixed(1) + ' stars' : 'Not listed'}
+- Reviews: ${f.userRatingCount != null ? f.userRatingCount : 'Not listed'}
+- Price level: ${f.priceLevel || 'Not listed'}
+- Photos on Google profile: ${f.photoCount != null ? f.photoCount : 'Not listed'}
+- Website listed on Google profile: ${f.hasWebsite ? 'Yes' : 'No'}
+- Hours coverage: ${f.hours ? f.hours.text : 'Not listed'}
+- Address: ${f.address || 'Not listed'}`;
+}
+
+function buildCompetitorPrompt(yours, theirs, language) {
+  const langLine = language === 'ro'
+    ? 'Write every string value in the JSON response in Romanian.'
+    : 'Write every string value in the JSON response in English.';
+
+  let gapLine = '';
+  if (yours.userRatingCount != null && theirs.userRatingCount != null && theirs.userRatingCount > yours.userRatingCount) {
+    const gap = theirs.userRatingCount - yours.userRatingCount;
+    gapLine = `\n\nReview gap: the competitor has ${gap} more reviews than you (${theirs.userRatingCount} vs ${yours.userRatingCount}). At least one of the 5 moves MUST reference this exact number (e.g. "you need ${gap} more reviews to match them").`;
+  }
+
+  const system = `You are a local-business competitive-intelligence API. Respond ONLY with a single valid JSON object matching the schema below — no markdown code fences, no preamble, no commentary.
+
+Schema:
+{
+  "verdict": { "summary": string, "winning": boolean },
+  "scoreboard": [ { "metric": "Rating" | "Reviews" | "Price level" | "Photos" | "Website" | "Hours coverage", "yours": string, "theirs": string, "winner": "you" | "them" | "tie", "note": string } ],
+  "their_strengths": [ { "point": string, "evidence": string } ],
+  "their_weaknesses": [ { "point": string, "evidence": string } ],
+  "moves": [ { "action": string, "impact": "high" | "medium", "effort": "low" | "medium" | "high", "why": string } ],
+  "positioning": string
+}
+
+Grounding rules — follow strictly:
+- Every strength, weakness, and move MUST cite one of the data points given below (rating, review count, price level, photo count, website presence, category, hours). If a claim cannot be supported by the data given, omit it entirely — never invent it.
+- Never invent facts about menu items, staff, atmosphere, interior decor, or specific prices — none of that data is provided below.
+- FORBIDDEN words anywhere in the response: "likely", "may", "might", "could be", "probably", "perhaps", "seems to". State only what the data supports — no hedging.
+- No generic advice ("post more on social media", "improve customer service") unless tied directly to a specific data point in this comparison.
+- "scoreboard" must have exactly 6 rows, one per metric, in this exact order: Rating, Reviews, Price level, Photos, Website, Hours coverage. Set "yours" and "theirs" to the exact values given in the facts below for that metric — do not recompute, round differently, or alter them. "note" is one short line of commentary on that row.
+- "their_strengths": 2-4 items. "their_weaknesses": 2-4 items.
+- "moves": exactly 5 items, sorted by impact descending (all "high" items before "medium" items), then by effort ascending ("low" before "medium" before "high") within the same impact level. Each "action" must be phrased as something to do THIS WEEK, with a concrete number where the data supports one.
+- "positioning": exactly one sentence — a differentiator grounded in the data above, not generic.
+- "verdict.summary": 1-2 sentences covering where the user's business wins, where it loses, and the single most important move.
+- "verdict.winning": true if the user's business is ahead of the competitor on more of the 6 scoreboard metrics than it trails on, false otherwise.
+- ${langLine}`;
+
+  const user = `${buildCompetitorFactsBlock('YOUR BUSINESS', yours)}
+
+${buildCompetitorFactsBlock('COMPETITOR', theirs)}${gapLine}
+
+Generate the full competitive analysis JSON per the system schema, comparing YOUR BUSINESS against COMPETITOR.`;
+
+  return { system, user };
+}
+
+function parseCompetitorJson(raw) {
+  const stripped = String(raw || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+  const match = stripped.match(/\{[\s\S]*\}/);
+  return JSON.parse(match ? match[0] : stripped);
+}
+
+app.post('/generate-competitor-analysis', async (req, res) => {
+  const { yourPlace, theirPlace, language } = req.body;
+  if (!yourPlace?.name || !theirPlace?.name) {
+    return res.status(400).json({ error: 'yourPlace and theirPlace (each with at least a name) are required' });
+  }
+
+  const yours = buildCompetitorFacts(yourPlace);
+  const theirs = buildCompetitorFacts(theirPlace);
+  const scoreboard = computeScoreboard(yours, theirs);
+  const { system, user } = buildCompetitorPrompt(yours, theirs, language);
+
+  const callGroq = async () => {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 1800,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user',   content: user },
+        ],
+      }),
+    });
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+  };
+
+  try {
+    let raw = await callGroq();
+    let result;
+    try {
+      result = parseCompetitorJson(raw);
+    } catch {
+      // One retry — Groq occasionally wraps JSON in commentary despite
+      // response_format: json_object; a second call usually self-corrects.
+      raw = await callGroq();
+      try {
+        result = parseCompetitorJson(raw);
+      } catch {
+        return res.status(502).json({ error: 'Could not generate the competitor analysis right now — please try again.', raw });
+      }
+    }
+
+    result.scoreboard = mergeScoreboard(scoreboard, result.scoreboard);
+    const youWins = scoreboard.filter(r => r.winner === 'you').length;
+    const themWins = scoreboard.filter(r => r.winner === 'them').length;
+    if (result.verdict && typeof result.verdict === 'object') {
+      result.verdict.winning = youWins > themWins;
+    }
+
+    res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
